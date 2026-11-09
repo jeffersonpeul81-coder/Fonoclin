@@ -207,6 +207,23 @@ def exames_do_paciente(paciente_id: int):
         return exs
 
 
+def listar_exames(data_ini: date, data_fim: date, empresa_id: int | None = None,
+                  tipos: list[str] | None = None):
+    """Exames do período (com paciente e empresa carregados) para emissão em lote."""
+    with Session() as s:
+        q = (select(Audiometria)
+             .where(Audiometria.data_exame >= data_ini, Audiometria.data_exame <= data_fim)
+             .order_by(Audiometria.data_exame, Audiometria.id))
+        if empresa_id:
+            q = q.where(Audiometria.empresa_id == empresa_id)
+        if tipos:
+            q = q.where(Audiometria.tipo_exame.in_(tipos))
+        exs = list(s.scalars(q))
+        for e in exs:
+            _ = e.paciente, e.empresa
+        return exs
+
+
 def exame_completo(exame_id: int):
     """Exame com paciente e empresa carregados (para o relatório)."""
     with Session() as s:

@@ -31,7 +31,7 @@ def desenhar(sigla: str, orelha: dict, largura=4.3, altura=3.45) -> bytes:
     vo = orelha.get("vo", {}) or {}
     vo_m = orelha.get("vo_mask", {}) or {}
 
-    fig, ax = plt.subplots(figsize=(largura, altura), dpi=200)
+    fig, ax = plt.subplots(figsize=(largura, altura), dpi=160)
     ax.set_xlim(-0.4, _x(8000) + 0.4)
     ax.set_ylim(120, -10)
     ax.set_xticks([_x(f) for f in FREQS_VA])

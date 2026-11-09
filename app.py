@@ -13,7 +13,7 @@ import db
 from classificacao import (ACEITAVEL, FREQS_VA, SUGESTIVO, avaliar_orelha, br,
                            sugerir_parecer)
 from db import Audiometria, Empresa, Paciente
-from relatorio import gerar_pdf
+from relatorio import gerar_pdf, gerar_pdf_lote, gerar_zip, nome_arquivo
 
 st.set_page_config(page_title="Audiometria Ocupacional", page_icon="🦻", layout="wide")
 
@@ -121,12 +121,21 @@ COLS_EDITOR = {
 
 
 def pdf_bytes(exame_id: int) -> bytes:
-    return gerar_pdf(db.exame_completo(exame_id), db.get_profissional())
+    """Gera o laudo uma única vez por sessão (reaproveita até o exame ser alterado)."""
+    cache = ss.setdefault("pdf_cache", {})
+    if exame_id not in cache:
+        cache[exame_id] = gerar_pdf(db.exame_completo(exame_id), db.get_profissional())
+    return cache[exame_id]
 
 
-def nome_arquivo(ex) -> str:
-    nome = "".join(c if c.isalnum() else "_" for c in ex.paciente.nome)[:40]
-    return f"Audiometria_{nome}_{ex.data_exame:%Y-%m-%d}.pdf"
+def limpar_cache_pdf(exame_id=None):
+    if exame_id is None:
+        ss.pop("pdf_cache", None)
+        for k in [k for k in ss if str(k).startswith("pdfbytes")]:
+            ss.pop(k, None)
+    else:
+        ss.get("pdf_cache", {}).pop(exame_id, None)
+        ss.pop(f"pdfbytes{exame_id}", None)
 
 
 # ------------------------------------------------------------------ páginas
@@ -305,6 +314,7 @@ def pagina_exame():
             criado_em=exame.criado_em if exame else datetime.now(),
         )
         salvo = db.salvar(novo)
+        limpar_cache_pdf(salvo.id)
         ss["ultimo_exame"] = salvo.id
         ss.pop("edit_id", None)
         ss.pop("novo_pac", None)
@@ -413,6 +423,7 @@ def pagina_pacientes():
                 conf = c[2].checkbox("Confirmar exclusão", key=f"cf{e.id}")
                 if c[2].button("🗑️ Excluir", key=f"del{e.id}", disabled=not conf):
                     db.excluir(Audiometria, e.id)
+                    limpar_cache_pdf(e.id)
                     st.rerun()
     with aba_dados:
         form_paciente(pac)
@@ -494,6 +505,7 @@ def pagina_config():
             if assin:
                 p.assinatura = assin.getvalue()
             db.salvar(p)
+            limpar_cache_pdf()
             st.success("Configurações salvas.")
             st.rerun()
     c = st.columns(2)
@@ -520,6 +532,83 @@ def pagina_config():
                            f"backup_audiometria_{date.today():%Y-%m-%d}.json", "application/json")
 
 
+def pagina_lote():
+    st.header("🖨️ Emissão de laudos em lote")
+    st.caption("Filtre os exames, marque os que deseja e gere todos os laudos de uma vez.")
+    empresas = db.listar_empresas()
+    mapa_emp = {e.id: e for e in empresas}
+    hoje = date.today()
+    c = st.columns([1, 1, 2, 2])
+    ini = c[0].date_input("De", value=hoje.replace(day=1), format="DD/MM/YYYY", key="lote_ini")
+    fim = c[1].date_input("Até", value=hoje, format="DD/MM/YYYY", key="lote_fim")
+    emp_id = c[2].selectbox("Empresa", [None] + list(mapa_emp), key="lote_emp",
+                            format_func=lambda i: "Todas" if i is None else mapa_emp[i].razao_social)
+    tipos = c[3].multiselect("Tipo de exame", TIPOS, key="lote_tipos", placeholder="Todos")
+    if ini > fim:
+        st.error("A data inicial é posterior à final.")
+        return
+
+    exames = db.listar_exames(ini, fim, emp_id, tipos)
+    if not exames:
+        st.info("Nenhum exame encontrado nesse filtro.")
+        return
+    mapa_ex = {e.id: e for e in exames}
+
+    tabela = pd.DataFrame([{
+        "Emitir": True, "id": e.id, "Data": e.data_exame.strftime("%d/%m/%Y"),
+        "Funcionário": e.paciente.nome,
+        "Empresa": e.empresa.razao_social if e.empresa else "",
+        "Tipo": e.tipo_exame,
+    } for e in exames])
+    chave = f"lote_tab_{ini}_{fim}_{emp_id}_{'-'.join(tipos)}"
+    c = st.columns([1, 1, 4])
+    if c[0].button("Marcar todos"):
+        ss[chave + "_todos"] = True
+        ss.pop(chave, None)
+    if c[1].button("Desmarcar todos"):
+        ss[chave + "_todos"] = False
+        ss.pop(chave, None)
+    tabela["Emitir"] = ss.get(chave + "_todos", True)
+    editada = st.data_editor(
+        tabela, key=chave, hide_index=True, width="stretch",
+        column_order=["Emitir", "Data", "Funcionário", "Empresa", "Tipo"],
+        disabled=["Data", "Funcionário", "Empresa", "Tipo"],
+        column_config={"Emitir": st.column_config.CheckboxColumn(width="small")})
+    selecionados = [mapa_ex[i] for i in editada.loc[editada["Emitir"], "id"]]
+    st.markdown(f"**{len(selecionados)}** de {len(exames)} exame(s) selecionado(s).")
+
+    c = st.columns(2)
+    formato = None
+    if c[0].button("📄 Gerar PDF único (para imprimir)", type="primary",
+                   disabled=not selecionados, width="stretch"):
+        formato = "pdf"
+    if c[1].button("🗂️ Gerar ZIP (um PDF por funcionário)",
+                   disabled=not selecionados, width="stretch"):
+        formato = "zip"
+
+    if formato:
+        barra = st.progress(0.0, text="Gerando laudos…")
+
+        def progresso(feito, total):
+            barra.progress(feito / total, text=f"Gerando laudo {feito} de {total}…")
+
+        prof = db.get_profissional()
+        periodo = f"{ini:%Y-%m-%d}_a_{fim:%Y-%m-%d}"
+        if formato == "pdf":
+            ss["lote_arquivo"] = (gerar_pdf_lote(selecionados, prof, progresso),
+                                  f"Laudos_{periodo}.pdf", "application/pdf")
+        else:
+            ss["lote_arquivo"] = (gerar_zip(selecionados, prof, progresso),
+                                  f"Laudos_{periodo}.zip", "application/zip")
+        barra.empty()
+        ss["lote_qtd"] = len(selecionados)
+
+    if ss.get("lote_arquivo"):
+        dados, nome, mime = ss["lote_arquivo"]
+        st.success(f"{ss.get('lote_qtd', '')} laudo(s) prontos.")
+        st.download_button(f"⬇️ Baixar {nome}", dados, nome, mime, type="primary")
+
+
 # ------------------------------------------------------------------ roteamento
 if autenticado():
     with st.sidebar:
@@ -528,12 +617,14 @@ if autenticado():
         ini("pagina", "Nova audiometria")
         if "ir_pagina" in ss:
             ss["pagina"] = ss.pop("ir_pagina")
-        st.radio("Menu", ["Nova audiometria", "Pacientes e histórico", "Empresas",
-                          "Configurações"], key="pagina", label_visibility="collapsed")
+        st.radio("Menu", ["Nova audiometria", "Pacientes e histórico", "Emissão em lote",
+                          "Empresas", "Configurações"], key="pagina",
+                 label_visibility="collapsed")
         if ss.get("auth") and st.button("Sair"):
             ss.clear()
             st.rerun()
     {"Nova audiometria": pagina_exame,
      "Pacientes e histórico": pagina_pacientes,
+     "Emissão em lote": pagina_lote,
      "Empresas": pagina_empresas,
      "Configurações": pagina_config}[ss["pagina"]]()

@@ -1,5 +1,7 @@
 """Emissão do laudo de audiometria ocupacional em PDF (A4)."""
+import zipfile
 from datetime import date
+from functools import lru_cache
 from io import BytesIO
 
 from reportlab.lib import colors
@@ -8,8 +10,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
-from reportlab.platypus import (Image, Paragraph, SimpleDocTemplate, Spacer,
-                                Table, TableStyle)
+from reportlab.platypus import (Image, PageBreak, Paragraph, SimpleDocTemplate,
+                                Spacer, Table, TableStyle)
 
 from audiograma import desenhar
 from classificacao import FREQS_VA, avaliar_orelha, br
@@ -106,28 +108,12 @@ def _fmt_limiar(orelha, via, f):
     return txt
 
 
-def gerar_pdf(exame, profissional) -> bytes:
+def _elementos(exame, profissional) -> list:
+    """Monta o conteúdo (flowables) de um laudo."""
     pac = exame.paciente
     emp = exame.empresa
     lim = exame.limiares
     logo = exame.logoaudiometria
-    buf = BytesIO()
-
-    def rodape(canvas, doc):
-        canvas.saveState()
-        canvas.setFont(FR, 6.5)
-        canvas.setFillColor(colors.grey)
-        partes = [profissional.clinica or profissional.nome,
-                  " – ".join(x for x in (profissional.endereco, profissional.cidade_uf) if x),
-                  profissional.telefone, profissional.email]
-        canvas.drawCentredString(A4[0] / 2, 0.8 * cm, " · ".join(p for p in partes if p))
-        canvas.drawRightString(A4[0] - 1.2 * cm, 0.8 * cm, f"Pág. {doc.page}")
-        canvas.restoreState()
-
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.2 * cm, rightMargin=1.2 * cm,
-                            topMargin=1.0 * cm, bottomMargin=1.4 * cm,
-                            title=f"Audiometria - {pac.nome}",
-                            author=profissional.nome or "")
     el = []
 
     # ---------- cabeçalho
@@ -145,12 +131,11 @@ def gerar_pdf(exame, profissional) -> bytes:
         info.append(Paragraph(cont, st_cab))
 
     if profissional.logo:
-        img = ImageReader(BytesIO(profissional.logo))
-        iw, ih = img.getSize()
+        logo_bytes, (iw, ih) = _logo_otimizada(profissional.logo)
         h = 1.9 * cm
         w = min(h * iw / ih, 4.2 * cm)
         h = w * ih / iw
-        logo_img = Image(BytesIO(profissional.logo), width=w, height=h)
+        logo_img = Image(BytesIO(logo_bytes), width=w, height=h)
         cab = Table([[logo_img, info, ""]], colWidths=[4.4 * cm, LARG - 8.8 * cm, 4.4 * cm])
     else:
         cab = Table([[info]], colWidths=[LARG])
@@ -301,5 +286,85 @@ def gerar_pdf(exame, profissional) -> bytes:
     ass.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "BOTTOM")]))
     el.append(ass)
 
-    doc.build(el, onFirstPage=rodape, onLaterPages=rodape)
+    return el
+
+
+# ------------------------------------------------------------------ montagem
+@lru_cache(maxsize=4)
+def _logo_otimizada(original: bytes):
+    """Reduz a logo para ~600 px: o PDF fica menor e é gerado bem mais rápido."""
+    from PIL import Image as PILImage
+    im = PILImage.open(BytesIO(original))
+    im.thumbnail((600, 600))
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGBA")
+    out = BytesIO()
+    im.save(out, format="PNG", optimize=True)
+    return out.getvalue(), im.size
+
+
+def _rodape(profissional):
+    def desenhar_rodape(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(FR, 6.5)
+        canvas.setFillColor(colors.grey)
+        partes = [profissional.clinica or profissional.nome,
+                  " – ".join(x for x in (profissional.endereco, profissional.cidade_uf) if x),
+                  profissional.telefone, profissional.email]
+        canvas.drawCentredString(A4[0] / 2, 0.8 * cm, " · ".join(p for p in partes if p))
+        canvas.restoreState()
+    return desenhar_rodape
+
+
+def _documento(buf, titulo, profissional):
+    return SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.2 * cm, rightMargin=1.2 * cm,
+                             topMargin=1.0 * cm, bottomMargin=1.4 * cm,
+                             title=titulo, author=profissional.nome or "")
+
+
+def gerar_pdf(exame, profissional) -> bytes:
+    """Laudo de um único exame."""
+    buf = BytesIO()
+    doc = _documento(buf, f"Audiometria - {exame.paciente.nome}", profissional)
+    rod = _rodape(profissional)
+    doc.build(_elementos(exame, profissional), onFirstPage=rod, onLaterPages=rod)
+    return buf.getvalue()
+
+
+def gerar_pdf_lote(exames, profissional, progresso=None) -> bytes:
+    """Vários laudos em um único PDF (um por página), pronto para imprimir."""
+    buf = BytesIO()
+    doc = _documento(buf, f"Audiometrias - {len(exames)} laudos", profissional)
+    el = []
+    for i, ex in enumerate(exames):
+        if i:
+            el.append(PageBreak())
+        el += _elementos(ex, profissional)
+        if progresso:
+            progresso(i + 1, len(exames))
+    rod = _rodape(profissional)
+    doc.build(el, onFirstPage=rod, onLaterPages=rod)
+    return buf.getvalue()
+
+
+def nome_arquivo(exame) -> str:
+    nome = "".join(c if c.isalnum() else "_" for c in exame.paciente.nome)[:40].strip("_")
+    return f"Audiometria_{nome}_{exame.data_exame:%Y-%m-%d}.pdf"
+
+
+def gerar_zip(exames, profissional, progresso=None) -> bytes:
+    """Um PDF por exame, compactados em .zip (para enviar a cada empresa/funcionário)."""
+    buf = BytesIO()
+    usados = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, ex in enumerate(exames):
+            nome = nome_arquivo(ex)
+            if nome in usados:
+                nome = nome.replace(".pdf", f"_{ex.id}.pdf")
+            usados.add(nome)
+            pasta = "".join(c if c.isalnum() or c == " " else "_" for c in
+                            (ex.empresa.razao_social if ex.empresa else "SEM_EMPRESA"))[:40].strip()
+            z.writestr(f"{pasta}/{nome}", gerar_pdf(ex, profissional))
+            if progresso:
+                progresso(i + 1, len(exames))
     return buf.getvalue()
